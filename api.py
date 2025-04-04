@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from diffusers import StableDiffusionPipeline
 from peft import PeftModel
 import torch
@@ -22,7 +22,7 @@ device = None
 # Define lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup code
+    # Startup code - declare globals at the beginning
     global pipe, device
     
     logger.info("Starting model loading process")
@@ -51,9 +51,8 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown code
+    # Shutdown code - no need to redeclare globals here
     logger.info("Shutting down and cleaning up resources")
-    global pipe
     if pipe is not None:
         del pipe
         if torch.cuda.is_available():
@@ -66,7 +65,7 @@ class PromptRequest(BaseModel):
 # Initialize FastAPI with the lifespan manager
 app = FastAPI(title="Pokemon Image Generator API", lifespan=lifespan)
 
-# a very long timeout limit (30 minutes)
+# Increase timeout for long-running operations
 app.router.default_timeout = 1800.0  # 30 minutes in seconds
 
 # Add CORS middleware to allow requests from Streamlit Cloud
@@ -85,7 +84,7 @@ async def health_check():
 
 @app.post("/generate-image")
 async def generate_image(request: PromptRequest):
-    global pipe
+    # No need to redeclare global here since we're just using it, not modifying
     if pipe is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again in a moment.")
     
