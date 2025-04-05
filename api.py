@@ -186,45 +186,36 @@ async def start_generation(request: PromptRequest, background_tasks: BackgroundT
     logger.info(f"Started task {task_id} for prompt: {request.prompt}")
     return {"task_id": task_id}
 
-def generate_image_task(task_id: str, prompt: str, cancel_event: Event):
+def generate_image_task(task_id: str, prompt: str, cancel_event: Event = None):
     try:
         start_time = time.time()
         logger.info(f"Processing task {task_id} for prompt: {prompt}")
         
-        # Use existing image generation code with cancellation checks
+        # Define proper callback that doesn't interfere with pipeline operations
+        def callback_on_step_end(pipe, i, t, callback_kwargs):
+            # Check if cancellation was requested
+            if cancel_event and cancel_event.is_set():
+                logger.info(f"Task {task_id} cancellation requested")
+                # Return False to stop the generation
+                return {"skip_step": True}
+            return {}
+        
+        # Use callback_on_step_end instead of callback
         if device == "cuda":
             with torch.autocast(device_type="cuda"):
-                # Create pipeline object with num_inference_steps set
-                pipe_output = pipe(
-                    prompt,
-                    num_inference_steps=50,
+                image = pipe(
+                    prompt, 
+                    num_inference_steps=50, 
                     guidance_scale=7.5,
-                    callback=lambda step, *_: cancel_event.is_set()  # Will stop if True
-                )
-                # Check for cancellation
-                if cancel_event.is_set():
-                    logger.info(f"Task {task_id} was cancelled")
-                    if task_id in task_storage:
-                        task_storage[task_id]["status"] = "cancelled"
-                    return
-                
-                image = pipe_output.images[0]
+                    callback_on_step_end=callback_on_step_end if cancel_event else None
+                ).images[0]
         else:
-            # CPU version with cancellation check
-            pipe_output = pipe(
-                prompt,
-                num_inference_steps=50,
+            image = pipe(
+                prompt, 
+                num_inference_steps=50, 
                 guidance_scale=7.5,
-                callback=lambda step, *_: cancel_event.is_set()  # Will stop if True
-            )
-            # Check for cancellation
-            if cancel_event.is_set():
-                logger.info(f"Task {task_id} was cancelled")
-                if task_id in task_storage:
-                    task_storage[task_id]["status"] = "cancelled"
-                return
-                
-            image = pipe_output.images[0]
+                callback_on_step_end=callback_on_step_end if cancel_event else None
+            ).images[0]
         
         # Convert and store image
         buffered = BytesIO()
