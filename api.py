@@ -191,55 +191,79 @@ def generate_image_task(task_id: str, prompt: str, cancel_event: Event = None):
         start_time = time.time()
         logger.info(f"Processing task {task_id} for prompt: {prompt}")
         
-        # Define proper callback that doesn't interfere with pipeline operations
-        def callback_on_step_end(pipe, i, t, callback_kwargs):
+        # Handle cancellation in a more direct way
+        if cancel_event and cancel_event.is_set():
+            logger.info(f"Task {task_id} cancelled before starting generation")
+            if task_id in task_storage:
+                task_storage[task_id]["status"] = "cancelled"
+            return
+
+        # Setup cancellation callback with special handling for different diffusers versions
+        def custom_callback(step, timestep, latents):
             # Check if cancellation was requested
             if cancel_event and cancel_event.is_set():
                 logger.info(f"Task {task_id} cancellation requested")
-                # Return False to stop the generation
-                return {"skip_step": True}
-            return {}
+                # Raise an exception to force the pipeline to stop
+                raise StopIteration("Task cancelled by user")
+            return {"skip_step": False}
         
-        # Use callback_on_step_end instead of callback
-        if device == "cuda":
-            with torch.autocast(device_type="cuda"):
+        try:
+            # Use device-specific generation with cancellation handling
+            if device == "cuda":
+                with torch.autocast(device_type="cuda"):
+                    image = pipe(
+                        prompt, 
+                        num_inference_steps=50, 
+                        guidance_scale=7.5,
+                        callback_on_step_end=custom_callback if cancel_event else None,
+                        callback_on_step_end_tensor_inputs=['latents'],
+                    ).images[0]
+            else:
                 image = pipe(
                     prompt, 
                     num_inference_steps=50, 
                     guidance_scale=7.5,
-                    callback_on_step_end=callback_on_step_end if cancel_event else None
+                    callback_on_step_end=custom_callback if cancel_event else None,
+                    callback_on_step_end_tensor_inputs=['latents'],
                 ).images[0]
-        else:
-            image = pipe(
-                prompt, 
-                num_inference_steps=50, 
-                guidance_scale=7.5,
-                callback_on_step_end=callback_on_step_end if cancel_event else None
-            ).images[0]
-        
-        # Convert and store image
-        buffered = BytesIO()
-        image.save(buffered, format="PNG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-        
-        # Store result
-        image_storage[task_id] = img_str
-        task_storage[task_id]["status"] = "completed"
-        
-        # Log the total generation time
-        end_time = time.time()
-        generation_time = end_time - start_time
-        logger.info(f"Task {task_id} completed successfully in {generation_time:.2f} seconds")
+                
+            # Convert and store image (only if not cancelled)
+            if cancel_event and cancel_event.is_set():
+                if task_id in task_storage:
+                    task_storage[task_id]["status"] = "cancelled"
+                return
+                
+            buffered = BytesIO()
+            image.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+            
+            # Store result
+            image_storage[task_id] = img_str
+            task_storage[task_id]["status"] = "completed"
+            
+            # Log the total generation time
+            end_time = time.time()
+            generation_time = end_time - start_time
+            logger.info(f"Task {task_id} completed successfully in {generation_time:.2f} seconds")
+            
+        except StopIteration as e:
+            # This is our cancellation exception - handle it gracefully
+            logger.info(f"Task {task_id} was cancelled during processing")
+            if task_id in task_storage:
+                task_storage[task_id]["status"] = "cancelled"
+            return
+            
     except Exception as e:
-        if cancel_event.is_set():
+        error_msg = str(e)
+        if "Task cancelled" in error_msg or (cancel_event and cancel_event.is_set()):
             logger.info(f"Task {task_id} was cancelled")
             if task_id in task_storage:
                 task_storage[task_id]["status"] = "cancelled"
         else:
-            logger.error(f"Task {task_id} failed: {str(e)}")
+            logger.error(f"Task {task_id} failed: {error_msg}")
             if task_id in task_storage:
                 task_storage[task_id]["status"] = "failed"
-                task_storage[task_id]["error"] = str(e)
+                task_storage[task_id]["error"] = error_msg
     finally:
         # Clean up the cancellation event
         if task_id in task_cancellation_events:
