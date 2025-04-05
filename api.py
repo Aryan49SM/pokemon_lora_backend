@@ -83,14 +83,12 @@ async def health_check():
     return {"status": "online", "model": "loaded" if pipe is not None else "not_loaded"}
 
 @app.post("/generate-image")
-async def generate_image(request: PromptRequest):
-    # No need to redeclare global here since we're just using it, not modifying
+def generate_image(request: PromptRequest):
     if pipe is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again in a moment.")
     
     logger.info(f"Generating image for prompt: {request.prompt}")
     try:
-        # Log the start time for monitoring long operations
         import time
         start_time = time.time()
         
