@@ -13,6 +13,7 @@ import uuid
 import time
 import asyncio
 from typing import Dict, Any
+from threading import Event
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 # Global variables
 pipe = None
 device = None
+task_cancellation_events = {}
 
 # Task storage with timestamps
 task_storage: Dict[str, Dict[str, Any]] = {}
@@ -167,29 +169,62 @@ async def start_generation(request: PromptRequest, background_tasks: BackgroundT
         raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again in a moment.")
     
     task_id = str(uuid.uuid4())
+    
+    # Create a cancellation event for this task
+    cancel_event = Event()
+    task_cancellation_events[task_id] = cancel_event
+    
     task_storage[task_id] = {
         "status": "processing", 
         "prompt": request.prompt,
         "created_at": time.time()
     }
     
-    # Run image generation in the background
-    background_tasks.add_task(generate_image_task, task_id, request.prompt)
+    # Run image generation in the background with cancellation event
+    background_tasks.add_task(generate_image_task, task_id, request.prompt, cancel_event)
     
     logger.info(f"Started task {task_id} for prompt: {request.prompt}")
     return {"task_id": task_id}
 
-def generate_image_task(task_id: str, prompt: str):
+def generate_image_task(task_id: str, prompt: str, cancel_event: Event):
     try:
         start_time = time.time()
         logger.info(f"Processing task {task_id} for prompt: {prompt}")
         
-        # Use existing image generation code
+        # Use existing image generation code with cancellation checks
         if device == "cuda":
             with torch.autocast(device_type="cuda"):
-                image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
+                # Create pipeline object with num_inference_steps set
+                pipe_output = pipe(
+                    prompt,
+                    num_inference_steps=50,
+                    guidance_scale=7.5,
+                    callback=lambda step, *_: cancel_event.is_set()  # Will stop if True
+                )
+                # Check for cancellation
+                if cancel_event.is_set():
+                    logger.info(f"Task {task_id} was cancelled")
+                    if task_id in task_storage:
+                        task_storage[task_id]["status"] = "cancelled"
+                    return
+                
+                image = pipe_output.images[0]
         else:
-            image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
+            # CPU version with cancellation check
+            pipe_output = pipe(
+                prompt,
+                num_inference_steps=50,
+                guidance_scale=7.5,
+                callback=lambda step, *_: cancel_event.is_set()  # Will stop if True
+            )
+            # Check for cancellation
+            if cancel_event.is_set():
+                logger.info(f"Task {task_id} was cancelled")
+                if task_id in task_storage:
+                    task_storage[task_id]["status"] = "cancelled"
+                return
+                
+            image = pipe_output.images[0]
         
         # Convert and store image
         buffered = BytesIO()
@@ -205,9 +240,19 @@ def generate_image_task(task_id: str, prompt: str):
         generation_time = end_time - start_time
         logger.info(f"Task {task_id} completed successfully in {generation_time:.2f} seconds")
     except Exception as e:
-        task_storage[task_id]["status"] = "failed"
-        task_storage[task_id]["error"] = str(e)
-        logger.error(f"Task {task_id} failed: {str(e)}")
+        if cancel_event.is_set():
+            logger.info(f"Task {task_id} was cancelled")
+            if task_id in task_storage:
+                task_storage[task_id]["status"] = "cancelled"
+        else:
+            logger.error(f"Task {task_id} failed: {str(e)}")
+            if task_id in task_storage:
+                task_storage[task_id]["status"] = "failed"
+                task_storage[task_id]["error"] = str(e)
+    finally:
+        # Clean up the cancellation event
+        if task_id in task_cancellation_events:
+            del task_cancellation_events[task_id]
 
 @app.get("/task-status/{task_id}")
 async def get_task_status(task_id: str):
@@ -234,10 +279,19 @@ async def get_generated_image(task_id: str):
 
 @app.delete("/cleanup-task/{task_id}")
 async def cleanup_task(task_id: str):
-    """Manually clean up a task and its associated image"""
+    """Manually clean up a task and attempt to cancel it if running"""
     found = False
     
+    # Signal cancellation if the task is still running
+    if task_id in task_cancellation_events:
+        task_cancellation_events[task_id].set()
+        found = True
+        logger.info(f"Signaled cancellation for task {task_id}")
+    
     if task_id in task_storage:
+        # Update status if still processing
+        if task_storage[task_id]["status"] == "processing":
+            task_storage[task_id]["status"] = "cancelled"
         del task_storage[task_id]
         found = True
         
