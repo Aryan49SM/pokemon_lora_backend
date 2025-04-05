@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from diffusers import StableDiffusionPipeline
 from peft import PeftModel
 import torch
@@ -9,6 +9,10 @@ from pydantic import BaseModel
 import logging
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import uuid
+import time
+import asyncio
+from typing import Dict, Any
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -18,6 +22,10 @@ logger = logging.getLogger(__name__)
 # Global variables
 pipe = None
 device = None
+
+# Task storage with timestamps
+task_storage: Dict[str, Dict[str, Any]] = {}
+image_storage: Dict[str, str] = {}
 
 # Define lifespan context manager
 @asynccontextmanager
@@ -46,17 +54,46 @@ async def lifespan(app: FastAPI):
         pipe.unet = unet
         pipe = pipe.to(device)
         logger.info("Model loaded successfully")
+        
+        # Start the background cleanup task
+        asyncio.create_task(cleanup_expired_tasks())
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
     
     yield
     
-    # Shutdown code - no need to redeclare globals here
+    # Shutdown code
     logger.info("Shutting down and cleaning up resources")
     if pipe is not None:
         del pipe
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+# Background task to periodically clean up expired tasks
+async def cleanup_expired_tasks():
+    while True:
+        try:
+            current_time = time.time()
+            expired_tasks = []
+            
+            # Find tasks older than 1 hour (3600 seconds)
+            for task_id, task_data in task_storage.items():
+                if current_time - task_data.get("created_at", current_time) > 3600:
+                    expired_tasks.append(task_id)
+            
+            # Remove expired tasks
+            for task_id in expired_tasks:
+                if task_id in task_storage:
+                    del task_storage[task_id]
+                if task_id in image_storage:
+                    del image_storage[task_id]
+                logger.info(f"Cleaned up expired task {task_id}")
+            
+            # Run cleanup every 10 minutes
+            await asyncio.sleep(600)
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {str(e)}")
+            await asyncio.sleep(60)  # Retry after 1 minute if an error occurs
 
 # Define request model
 class PromptRequest(BaseModel):
@@ -82,6 +119,7 @@ app.add_middleware(
 async def health_check():
     return {"status": "online", "model": "loaded" if pipe is not None else "not_loaded"}
 
+# Original direct image generation endpoint (kept for compatibility)
 @app.post("/generate-image")
 def generate_image(request: PromptRequest):
     if pipe is None:
@@ -121,3 +159,110 @@ def generate_image(request: PromptRequest):
     except Exception as e:
         logger.error(f"Error generating image: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# New endpoints for async workflow
+@app.post("/start-generation")
+async def start_generation(request: PromptRequest, background_tasks: BackgroundTasks):
+    if pipe is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet. Please try again in a moment.")
+    
+    task_id = str(uuid.uuid4())
+    task_storage[task_id] = {
+        "status": "processing", 
+        "prompt": request.prompt,
+        "created_at": time.time()
+    }
+    
+    # Run image generation in the background
+    background_tasks.add_task(generate_image_task, task_id, request.prompt)
+    
+    logger.info(f"Started task {task_id} for prompt: {request.prompt}")
+    return {"task_id": task_id}
+
+def generate_image_task(task_id: str, prompt: str):
+    try:
+        start_time = time.time()
+        logger.info(f"Processing task {task_id} for prompt: {prompt}")
+        
+        # Use existing image generation code
+        if device == "cuda":
+            with torch.autocast(device_type="cuda"):
+                image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
+        else:
+            image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
+        
+        # Convert and store image
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        # Store result
+        image_storage[task_id] = img_str
+        task_storage[task_id]["status"] = "completed"
+        
+        # Log the total generation time
+        end_time = time.time()
+        generation_time = end_time - start_time
+        logger.info(f"Task {task_id} completed successfully in {generation_time:.2f} seconds")
+    except Exception as e:
+        task_storage[task_id]["status"] = "failed"
+        task_storage[task_id]["error"] = str(e)
+        logger.error(f"Task {task_id} failed: {str(e)}")
+
+@app.get("/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    if task_id not in task_storage:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return {
+        "status": task_storage[task_id]["status"],
+        "error": task_storage[task_id].get("error", None)
+    }
+
+@app.get("/get-image/{task_id}")
+async def get_generated_image(task_id: str):
+    if task_id not in task_storage:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    if task_storage[task_id]["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Image generation not completed")
+    
+    if task_id not in image_storage:
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    return {"image": image_storage[task_id], "prompt": task_storage[task_id]["prompt"]}
+
+@app.delete("/cleanup-task/{task_id}")
+async def cleanup_task(task_id: str):
+    """Manually clean up a task and its associated image"""
+    found = False
+    
+    if task_id in task_storage:
+        del task_storage[task_id]
+        found = True
+        
+    if task_id in image_storage:
+        del image_storage[task_id]
+        found = True
+        
+    if found:
+        logger.info(f"Manually cleaned up task {task_id}")
+        return {"status": "cleaned"}
+    else:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+@app.get("/active-tasks")
+async def get_active_tasks():
+    """Get information about currently active tasks"""
+    task_count = len(task_storage)
+    processing_tasks = sum(1 for t in task_storage.values() if t.get("status") == "processing")
+    completed_tasks = sum(1 for t in task_storage.values() if t.get("status") == "completed")
+    failed_tasks = sum(1 for t in task_storage.values() if t.get("status") == "failed")
+    
+    return {
+        "total": task_count,
+        "processing": processing_tasks,
+        "completed": completed_tasks,
+        "failed": failed_tasks,
+        "image_storage_size": len(image_storage)
+    }
