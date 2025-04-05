@@ -198,8 +198,8 @@ def generate_image_task(task_id: str, prompt: str, cancel_event: Event = None):
                 task_storage[task_id]["status"] = "cancelled"
             return
 
-        # Setup cancellation callback with special handling for different diffusers versions
-        def custom_callback(step, timestep, latents):
+        # Setup cancellation callback with the CORRECT SIGNATURE
+        def custom_callback(pipe, step, timestep, callback_kwargs):
             # Check if cancellation was requested
             if cancel_event and cancel_event.is_set():
                 logger.info(f"Task {task_id} cancellation requested")
@@ -215,16 +215,14 @@ def generate_image_task(task_id: str, prompt: str, cancel_event: Event = None):
                         prompt, 
                         num_inference_steps=50, 
                         guidance_scale=7.5,
-                        callback_on_step_end=custom_callback if cancel_event else None,
-                        callback_on_step_end_tensor_inputs=['latents'],
+                        callback_on_step_end=custom_callback if cancel_event else None
                     ).images[0]
             else:
                 image = pipe(
                     prompt, 
                     num_inference_steps=50, 
                     guidance_scale=7.5,
-                    callback_on_step_end=custom_callback if cancel_event else None,
-                    callback_on_step_end_tensor_inputs=['latents'],
+                    callback_on_step_end=custom_callback if cancel_event else None
                 ).images[0]
                 
             # Convert and store image (only if not cancelled)
